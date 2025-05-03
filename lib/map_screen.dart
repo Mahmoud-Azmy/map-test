@@ -12,6 +12,7 @@ import 'package:http/http.dart' as http;
 import 'package:latlong2/latlong.dart';
 import 'package:location/location.dart';
 import 'package:share_plus/share_plus.dart';
+
 import 'location_web.dart' if (dart.library.io) 'location_stub.dart';
 
 class LocationService {
@@ -488,22 +489,40 @@ class _MapScreenState extends State<MapScreen> {
       final nextPoint =
           (i + 1 < routePoints.length) ? routePoints[i + 1] : null;
 
+      // Calculate yaw (already in degrees)
       double yaw = 0.0;
       if (nextPoint != null) {
         final deltaLat = nextPoint.latitude - currentPoint.latitude;
         final deltaLng = nextPoint.longitude - currentPoint.longitude;
-        yaw = (atan2(deltaLng, deltaLat) * (180 / pi)) % 360;
+        yaw = (atan2(deltaLng, deltaLat) * (180 / pi)) % 360; // Yaw in degrees
       }
 
+      // Map LatLng to x, y (assuming longitude as x, latitude as y)
+      double x = currentPoint.longitude;
+      double y = currentPoint.latitude;
+
+      // Placeholder for z (elevation) - Using a constant from your image
+      double z = 0.325; // Adjust if you can fetch elevation data
+
+      // Placeholder for mps (speed) - Using a default value
+      double mps = 0.5; // Adjust as needed (e.g., calculate based on distance)
+
+      // Placeholder for change_flag - Using 0 as in your image
+      int changeFlag = 0;
+
       csvData.add({
-        'Latitude': currentPoint.latitude.toStringAsFixed(6),
-        'Longitude': currentPoint.longitude.toStringAsFixed(6),
-        'Yaw': yaw.toStringAsFixed(2),
+        'x': x.toStringAsFixed(6),
+        'y': y.toStringAsFixed(6),
+        'z': z.toStringAsFixed(3),
+        'yaw': yaw.toStringAsFixed(2),
+        'mps': mps.toStringAsFixed(2),
+        'change_flag': changeFlag.toString(),
       });
     }
 
+    // Update CSV headers to match the image
     final csvContent =
-        'Latitude,Longitude,Yaw\n${csvData.map((row) => '${row['Latitude']},${row['Longitude']},${row['Yaw']}').join('\n')}';
+        'x,y,z,yaw,mps,change_flag\n${csvData.map((row) => '${row['x']},${row['y']},${row['z']},${row['yaw']},${row['mps']},${row['change_flag']}').join('\n')}';
 
     try {
       if (kIsWeb) {
@@ -519,7 +538,8 @@ class _MapScreenState extends State<MapScreen> {
       } else {
         final file = await File('${Directory.systemTemp.path}/route_data.csv')
             .writeAsString(csvContent);
-        await Share.shareXFiles([XFile(file.path)], text: 'Exported route data');
+        await Share.shareXFiles([XFile(file.path)],
+            text: 'Exported route data');
       }
       _showSnackBar('Route data exported successfully.');
     } catch (e) {
