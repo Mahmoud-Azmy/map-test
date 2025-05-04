@@ -13,8 +13,22 @@ import 'package:latlong2/latlong.dart';
 import 'package:location/location.dart';
 import 'package:map_test/utm.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:web_socket_channel/io.dart'; // Use IOWebSocketChannel for non-web
+import 'package:web_socket_channel/web_socket_channel.dart'; // For WebSocket support
 
 import 'location_web.dart' if (dart.library.io) 'location_stub.dart';
+
+// Function to interpolate between two LatLng points
+List<LatLng> interpolatePoints(LatLng start, LatLng end, int numPoints) {
+  List<LatLng> interpolatedPoints = [];
+  for (int i = 0; i <= numPoints; i++) {
+    double fraction = i / numPoints;
+    double lat = start.latitude + (end.latitude - start.latitude) * fraction;
+    double lon = start.longitude + (end.longitude - start.longitude) * fraction;
+    interpolatedPoints.add(LatLng(lat, lon));
+  }
+  return interpolatedPoints;
+}
 
 class LocationService {
   static const String _nominatimUrl =
@@ -92,6 +106,8 @@ class _MapScreenState extends State<MapScreen> {
   bool locationInitialized = false;
   Timer? _debounce;
   StreamSubscription<LocationData>? _locationSubscription;
+  WebSocketChannel? _webSocketChannel; // WebSocket channel
+  bool isWebSocketConnected = false; // Track WebSocket connection status
 
   static const LatLng defaultLocation =
       LatLng(0, 0); // Default fallback location
@@ -102,6 +118,7 @@ class _MapScreenState extends State<MapScreen> {
     // Show a hint to the user about location features
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _showSnackBar('Tap the location button to show your current position.');
+      _connectWebSocket(); // Initialize WebSocket connection
     });
   }
 
@@ -111,7 +128,66 @@ class _MapScreenState extends State<MapScreen> {
     _locationSubscription?.cancel();
     _locationWeb.dispose();
     searchController.dispose();
+    _webSocketChannel?.sink.close(); // Close WebSocket connection
     super.dispose();
+  }
+
+  // Initialize WebSocket connection to the Python server
+  void _connectWebSocket() {
+    try {
+      const wsUrl = 'ws://127.0.0.1:8765'; // Match your Python server's URL
+      _webSocketChannel = kIsWeb
+          ? WebSocketChannel.connect(Uri.parse(wsUrl))
+          : IOWebSocketChannel.connect(wsUrl);
+
+      // Listen for server responses
+      _webSocketChannel!.stream.listen(
+        (message) {
+          final data = json.decode(message);
+          final response = data['response'] ?? 'No response';
+          _showSnackBar('Car response: $response');
+        },
+        onDone: () {
+          setState(() {
+            isWebSocketConnected = false;
+          });
+          _showSnackBar('WebSocket connection closed');
+        },
+        onError: (error) {
+          setState(() {
+            isWebSocketConnected = false;
+          });
+          _showSnackBar('WebSocket error: $error');
+        },
+      );
+
+      setState(() {
+        isWebSocketConnected = true;
+      });
+      _showSnackBar('WebSocket connected to car');
+    } catch (e) {
+      setState(() {
+        isWebSocketConnected = false;
+      });
+      _showSnackBar('Failed to connect to WebSocket: $e');
+    }
+  }
+
+  // Send command to the car via WebSocket
+  void _sendCommandToCar(String command) {
+    if (!isWebSocketConnected || _webSocketChannel == null) {
+      _showSnackBar('WebSocket not connected. Please try again.');
+      _connectWebSocket(); // Attempt to reconnect
+      return;
+    }
+
+    try {
+      final commandData = {'command': command};
+      _webSocketChannel!.sink.add(jsonEncode(commandData));
+      _showSnackBar('Command sent to car: $command');
+    } catch (e) {
+      _showSnackBar('Failed to send command: $e');
+    }
   }
 
   Future<void> _initializeLocation() async {
@@ -651,21 +727,37 @@ class _MapScreenState extends State<MapScreen> {
           ),
         ],
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: () {
-          if (!locationInitialized || locationPermissionDenied) {
-            _initializeLocation();
-          } else if (currentLocation != null) {
-            mapController.move(
-              LatLng(currentLocation!.latitude!, currentLocation!.longitude!),
-              15.0,
-            );
-          } else {
-            _showSnackBar(
-                'Location unavailable. Please enable location permissions.');
-          }
-        },
-        child: const Icon(Icons.my_location),
+      floatingActionButton: Column(
+        mainAxisAlignment: MainAxisAlignment.end,
+        children: [
+          FloatingActionButton(
+            onPressed: () {
+              if (!locationInitialized || locationPermissionDenied) {
+                _initializeLocation();
+              } else if (currentLocation != null) {
+                mapController.move(
+                  LatLng(
+                      currentLocation!.latitude!, currentLocation!.longitude!),
+                  15.0,
+                );
+              } else {
+                _showSnackBar(
+                    'Location unavailable. Please enable location permissions.');
+              }
+            },
+            child: const Icon(Icons.my_location),
+          ),
+          const SizedBox(height: 16), // Space between buttons
+          FloatingActionButton(
+            onPressed: () {
+              // Send a command to the car (e.g., "START")
+              _sendCommandToCar('START');
+            },
+            backgroundColor: isWebSocketConnected ? Colors.green : Colors.grey,
+            tooltip: 'Send Start Command to Car',
+            child: const Icon(Icons.play_arrow),
+          ),
+        ],
       ),
     );
   }
