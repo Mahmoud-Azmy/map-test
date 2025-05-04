@@ -14,8 +14,18 @@ async def handler(websocket):
             command = data.get("command", "unknown")
             print(f"Received from Flutter: {command}")
 
-            response = f"Python received: {command}"
-            await websocket.send(json.dumps({"response": response}))
+            if command == "GET_LOCATION":
+                # Static location for testing (near Cairo, Egypt)
+                location_data = {
+                    "location": {
+                        "lat": 29.36342,
+                        "lon": 30.99788
+                    }
+                }
+                await websocket.send(json.dumps(location_data))
+            else:
+                response = f"Python received: {command}"
+                await websocket.send(json.dumps({"response": response}))
     except websockets.exceptions.ConnectionClosed:
         print("Client disconnected")
     finally:
@@ -24,7 +34,7 @@ async def handler(websocket):
 async def main():
     async with websockets.serve(handler, "127.0.0.1", 8765):
         print("WebSocket server started on ws://127.0.0.1:8765")
-        await asyncio.Future()  # run forever
+        await asyncio.Future()  # Run forever
 
 if __name__ == "__main__":
     asyncio.run(main())

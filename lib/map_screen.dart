@@ -12,24 +12,14 @@ import 'package:http/http.dart' as http;
 import 'package:latlong2/latlong.dart';
 import 'package:location/location.dart';
 import 'package:map_test/utm.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
-import 'package:web_socket_channel/io.dart'; // Use IOWebSocketChannel for non-web
-import 'package:web_socket_channel/web_socket_channel.dart'; // For WebSocket support
+import 'package:web_socket_channel/io.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'location_web.dart' if (dart.library.io) 'location_stub.dart';
 
-// Function to interpolate between two LatLng points
-List<LatLng> interpolatePoints(LatLng start, LatLng end, int numPoints) {
-  List<LatLng> interpolatedPoints = [];
-  for (int i = 0; i <= numPoints; i++) {
-    double fraction = i / numPoints;
-    double lat = start.latitude + (end.latitude - start.latitude) * fraction;
-    double lon = start.longitude + (end.longitude - start.longitude) * fraction;
-    interpolatedPoints.add(LatLng(lat, lon));
-  }
-  return interpolatedPoints;
-}
-
+// Service for location-related API calls
 class LocationService {
   static const String _nominatimUrl =
       'https://nominatim.openstreetmap.org/search';
@@ -93,12 +83,16 @@ class MapScreen extends StatefulWidget {
 }
 
 class _MapScreenState extends State<MapScreen> {
+  // Map and location controllers
   final MapController mapController = MapController();
   final LocationService _locationService = LocationService();
   final Location _location = Location();
   final LocationWebPlugin _locationWeb = LocationWebPlugin();
   final TextEditingController searchController = TextEditingController();
-  LocationData? currentLocation;
+
+  // State variables
+  LocationData? userLocation;
+  LatLng? carLocation; // Car's location from WebSocket
   List<LatLng> routePoints = [];
   List<Marker> markers = [];
   bool isLoading = false;
@@ -106,19 +100,20 @@ class _MapScreenState extends State<MapScreen> {
   bool locationInitialized = false;
   Timer? _debounce;
   StreamSubscription<LocationData>? _locationSubscription;
-  WebSocketChannel? _webSocketChannel; // WebSocket channel
-  bool isWebSocketConnected = false; // Track WebSocket connection status
 
-  static const LatLng defaultLocation =
-      LatLng(0, 0); // Default fallback location
+  // WebSocket variables
+  WebSocketChannel? _webSocketChannel;
+  bool isWebSocketConnected = false;
+  Completer<LatLng>? _carLocationCompleter; // To wait for car location response
+
+  static const LatLng defaultLocation = LatLng(0, 0);
 
   @override
   void initState() {
     super.initState();
-    // Show a hint to the user about location features
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _showSnackBar('Tap the location button to show your current position.');
-      _connectWebSocket(); // Initialize WebSocket connection
+      _connectWebSocket();
     });
   }
 
@@ -128,56 +123,84 @@ class _MapScreenState extends State<MapScreen> {
     _locationSubscription?.cancel();
     _locationWeb.dispose();
     searchController.dispose();
-    _webSocketChannel?.sink.close(); // Close WebSocket connection
+    _webSocketChannel?.sink.close();
     super.dispose();
   }
 
-  // Initialize WebSocket connection to the Python server
+  // Show a snackbar with a message
+  void _showSnackBar(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
+  }
+
+  // Connect to the WebSocket server and handle messages
   void _connectWebSocket() {
     try {
-      const wsUrl = 'ws://127.0.0.1:8765'; // Match your Python server's URL
+      const wsUrl = 'ws://127.0.0.1:8765';
       _webSocketChannel = kIsWeb
           ? WebSocketChannel.connect(Uri.parse(wsUrl))
           : IOWebSocketChannel.connect(wsUrl);
 
-      // Listen for server responses
       _webSocketChannel!.stream.listen(
         (message) {
           final data = json.decode(message);
-          final response = data['response'] ?? 'No response';
-          _showSnackBar('Car response: $response');
+          if (data.containsKey('location')) {
+            final location = data['location'];
+            setState(() {
+              carLocation = LatLng(
+                location['lat'] as double,
+                location['lon'] as double,
+              );
+              _updateCarMarker();
+            });
+            // Complete the completer if waiting for a location update
+            if (_carLocationCompleter != null &&
+                !_carLocationCompleter!.isCompleted) {
+              _carLocationCompleter!.complete(carLocation);
+            }
+          } else if (data.containsKey('response')) {
+            final response = data['response'] ?? 'No response';
+            _showSnackBar('Car response: $response');
+          }
         },
         onDone: () {
-          setState(() {
-            isWebSocketConnected = false;
-          });
+          setState(() => isWebSocketConnected = false);
           _showSnackBar('WebSocket connection closed');
+          // Complete the completer with an error if the connection closes
+          if (_carLocationCompleter != null &&
+              !_carLocationCompleter!.isCompleted) {
+            _carLocationCompleter!.completeError('WebSocket connection closed');
+          }
         },
         onError: (error) {
-          setState(() {
-            isWebSocketConnected = false;
-          });
+          setState(() => isWebSocketConnected = false);
           _showSnackBar('WebSocket error: $error');
+          // Complete the completer with an error if there's a WebSocket error
+          if (_carLocationCompleter != null &&
+              !_carLocationCompleter!.isCompleted) {
+            _carLocationCompleter!.completeError(error);
+          }
         },
       );
 
-      setState(() {
-        isWebSocketConnected = true;
-      });
+      setState(() => isWebSocketConnected = true);
       _showSnackBar('WebSocket connected to car');
     } catch (e) {
-      setState(() {
-        isWebSocketConnected = false;
-      });
+      setState(() => isWebSocketConnected = false);
       _showSnackBar('Failed to connect to WebSocket: $e');
+      if (_carLocationCompleter != null &&
+          !_carLocationCompleter!.isCompleted) {
+        _carLocationCompleter!.completeError(e);
+      }
     }
   }
 
-  // Send command to the car via WebSocket
+  // Send a command to the car via WebSocket
   void _sendCommandToCar(String command) {
     if (!isWebSocketConnected || _webSocketChannel == null) {
       _showSnackBar('WebSocket not connected. Please try again.');
-      _connectWebSocket(); // Attempt to reconnect
+      _connectWebSocket();
       return;
     }
 
@@ -187,124 +210,154 @@ class _MapScreenState extends State<MapScreen> {
       _showSnackBar('Command sent to car: $command');
     } catch (e) {
       _showSnackBar('Failed to send command: $e');
+      if (_carLocationCompleter != null &&
+          !_carLocationCompleter!.isCompleted) {
+        _carLocationCompleter!.completeError(e);
+      }
     }
   }
 
-  Future<void> _initializeLocation() async {
+  // Fetch car location manually and zoom to it
+  Future<void> _fetchCarLocation() async {
+    if (!isWebSocketConnected || _webSocketChannel == null) {
+      _showSnackBar('WebSocket not connected. Please try again.');
+      _connectWebSocket();
+      return;
+    }
+
+    setState(() => isLoading = true);
+    _carLocationCompleter = Completer<LatLng>(); // Create a new completer
+
+    try {
+      _sendCommandToCar('GET_LOCATION');
+      // Wait for the car location to be updated
+      final location = await _carLocationCompleter!.future.timeout(
+        const Duration(seconds: 5),
+        onTimeout: () {
+          throw TimeoutException('Failed to get car location: Timed out');
+        },
+      );
+      // Zoom to the car location after receiving it
+      mapController.move(location, 15.0);
+    } catch (e) {
+      _showSnackBar('Failed to fetch car location: $e');
+    } finally {
+      setState(() => isLoading = false);
+      _carLocationCompleter = null; // Reset the completer
+    }
+  }
+
+  // Initialize user location with permission handling
+  Future<void> _initializeUserLocation() async {
     if (locationInitialized) return;
 
-    setState(() {
-      isLoading = true;
-    });
+    setState(() => isLoading = true);
 
     try {
       if (kIsWeb) {
-        // Web-specific location handling
-        final permissionStatus = await _locationWeb.hasPermission();
-        if (permissionStatus != PermissionStatus.granted) {
-          final newStatus = await _locationWeb.requestPermission();
-          if (newStatus != PermissionStatus.granted) {
-            setState(() {
-              locationPermissionDenied = true;
-            });
-            _showPermissionDialog();
-            return;
-          }
-        }
-
-        final userLocation = await _locationWeb.getLocation();
-        if (userLocation.latitude != null && userLocation.longitude != null) {
-          setState(() {
-            currentLocation = userLocation;
-            _addCurrentLocationMarker();
-            locationInitialized = true;
-          });
-          mapController.move(
-            LatLng(currentLocation!.latitude!, currentLocation!.longitude!),
-            15.0,
-          );
-        } else {
-          _showSnackBar('Invalid location data.');
-        }
-
-        _locationSubscription = _locationWeb.onLocationChanged().listen(
-          (LocationData newLocation) {
-            if (newLocation.latitude != null && newLocation.longitude != null) {
-              setState(() {
-                currentLocation = newLocation;
-                _updateCurrentLocationMarker();
-              });
-            }
-          },
-          onError: (e) {
-            _showSnackBar('Location update error: $e');
-          },
-        );
+        await _initializeWebLocation();
       } else {
-        // Native platform handling
-        bool serviceEnabled = await _location.serviceEnabled();
-        if (!serviceEnabled) {
-          serviceEnabled = await _location.requestService();
-          if (!serviceEnabled) {
-            _showSnackBar('Location services are disabled.');
-            setState(() {
-              locationPermissionDenied = true;
-            });
-            _showPermissionDialog();
-            return;
-          }
-        }
-
-        PermissionStatus permissionGranted = await _location.hasPermission();
-        if (permissionGranted == PermissionStatus.denied) {
-          permissionGranted = await _location.requestPermission();
-          if (permissionGranted != PermissionStatus.granted) {
-            setState(() {
-              locationPermissionDenied = true;
-            });
-            _showPermissionDialog();
-            return;
-          }
-        }
-
-        final userLocation = await _location.getLocation();
-        if (userLocation.latitude != null && userLocation.longitude != null) {
-          setState(() {
-            currentLocation = userLocation;
-            _addCurrentLocationMarker();
-            locationInitialized = true;
-          });
-          mapController.move(
-            LatLng(currentLocation!.latitude!, currentLocation!.longitude!),
-            15.0,
-          );
-        } else {
-          _showSnackBar('Invalid location data.');
-        }
-
-        _locationSubscription =
-            _location.onLocationChanged.listen((LocationData newLocation) {
-          if (newLocation.latitude != null && newLocation.longitude != null) {
-            setState(() {
-              currentLocation = newLocation;
-              _updateCurrentLocationMarker();
-            });
-          }
-        });
+        await _initializeNativeLocation();
       }
     } catch (e) {
       _showSnackBar('Failed to get location: $e');
-      setState(() {
-        locationPermissionDenied = true;
-      });
+      setState(() => locationPermissionDenied = true);
       _showPermissionDialog();
     } finally {
-      setState(() {
-        isLoading = false;
-      });
+      setState(() => isLoading = false);
     }
   }
 
+  Future<void> _initializeWebLocation() async {
+    final permissionStatus = await _locationWeb.hasPermission();
+    if (permissionStatus != PermissionStatus.granted) {
+      final newStatus = await _locationWeb.requestPermission();
+      if (newStatus != PermissionStatus.granted) {
+        setState(() => locationPermissionDenied = true);
+        _showPermissionDialog();
+        return;
+      }
+    }
+
+    final userLocationData = await _locationWeb.getLocation();
+    if (userLocationData.latitude != null &&
+        userLocationData.longitude != null) {
+      setState(() {
+        userLocation = userLocationData;
+        locationInitialized = true;
+        _updateUserMarker();
+      });
+      mapController.move(
+        LatLng(userLocation!.latitude!, userLocation!.longitude!),
+        15.0,
+      );
+    } else {
+      _showSnackBar('Invalid location data.');
+    }
+
+    _locationSubscription = _locationWeb.onLocationChanged().listen(
+      (LocationData newLocation) {
+        if (newLocation.latitude != null && newLocation.longitude != null) {
+          setState(() {
+            userLocation = newLocation;
+            _updateUserMarker();
+          });
+        }
+      },
+      onError: (e) => _showSnackBar('Location update error: $e'),
+    );
+  }
+
+  Future<void> _initializeNativeLocation() async {
+    bool serviceEnabled = await _location.serviceEnabled();
+    if (!serviceEnabled) {
+      serviceEnabled = await _location.requestService();
+      if (!serviceEnabled) {
+        _showSnackBar('Location services are disabled.');
+        setState(() => locationPermissionDenied = true);
+        _showPermissionDialog();
+        return;
+      }
+    }
+
+    PermissionStatus permissionGranted = await _location.hasPermission();
+    if (permissionGranted == PermissionStatus.denied) {
+      permissionGranted = await _location.requestPermission();
+      if (permissionGranted != PermissionStatus.granted) {
+        setState(() => locationPermissionDenied = true);
+        _showPermissionDialog();
+        return;
+      }
+    }
+
+    final userLocationData = await _location.getLocation();
+    if (userLocationData.latitude != null &&
+        userLocationData.longitude != null) {
+      setState(() {
+        userLocation = userLocationData;
+        locationInitialized = true;
+        _updateUserMarker();
+      });
+      mapController.move(
+        LatLng(userLocation!.latitude!, userLocation!.longitude!),
+        15.0,
+      );
+    } else {
+      _showSnackBar('Invalid location data.');
+    }
+
+    _locationSubscription =
+        _location.onLocationChanged.listen((LocationData newLocation) {
+      if (newLocation.latitude != null && newLocation.longitude != null) {
+        setState(() {
+          userLocation = newLocation;
+          _updateUserMarker();
+        });
+      }
+    });
+  }
+
+  // Retry location permission request
   Future<void> _retryLocationPermission() async {
     setState(() {
       locationPermissionDenied = false;
@@ -313,86 +366,90 @@ class _MapScreenState extends State<MapScreen> {
 
     try {
       if (kIsWeb) {
-        final permissionStatus = await _locationWeb.requestPermission();
-        if (permissionStatus == PermissionStatus.granted) {
-          final userLocation = await _locationWeb.getLocation();
-          if (userLocation.latitude != null && userLocation.longitude != null) {
-            setState(() {
-              currentLocation = userLocation;
-              _addCurrentLocationMarker();
-              locationInitialized = true;
-            });
-            mapController.move(
-              LatLng(currentLocation!.latitude!, currentLocation!.longitude!),
-              15.0,
-            );
-          }
-          _locationSubscription?.cancel();
-          _locationSubscription = _locationWeb.onLocationChanged().listen(
-            (LocationData newLocation) {
-              if (newLocation.latitude != null &&
-                  newLocation.longitude != null) {
-                setState(() {
-                  currentLocation = newLocation;
-                  _updateCurrentLocationMarker();
-                });
-              }
-            },
-            onError: (e) {
-              _showSnackBar('Location update error: $e');
-            },
-          );
-        } else {
-          setState(() {
-            locationPermissionDenied = true;
-          });
-          _showPermissionDialog();
-        }
+        await _retryWebLocationPermission();
       } else {
-        final permissionStatus = await _location.requestPermission();
-        if (permissionStatus == PermissionStatus.granted) {
-          final userLocation = await _location.getLocation();
-          if (userLocation.latitude != null && userLocation.longitude != null) {
-            setState(() {
-              currentLocation = userLocation;
-              _addCurrentLocationMarker();
-              locationInitialized = true;
-            });
-            mapController.move(
-              LatLng(currentLocation!.latitude!, currentLocation!.longitude!),
-              15.0,
-            );
-          }
-          _locationSubscription?.cancel();
-          _locationSubscription =
-              _location.onLocationChanged.listen((LocationData newLocation) {
-            if (newLocation.latitude != null && newLocation.longitude != null) {
-              setState(() {
-                currentLocation = newLocation;
-                _updateCurrentLocationMarker();
-              });
-            }
-          });
-        } else {
-          setState(() {
-            locationPermissionDenied = true;
-          });
-          _showPermissionDialog();
-        }
+        await _retryNativeLocationPermission();
       }
     } catch (e) {
       _showSnackBar('Failed to get location: $e');
-      setState(() {
-        locationPermissionDenied = true;
-      });
+      setState(() => locationPermissionDenied = true);
       _showPermissionDialog();
     } finally {
-      setState(() {
-        isLoading = false;
-      });
+      setState(() => isLoading = false);
     }
   }
 
+  Future<void> _retryWebLocationPermission() async {
+    final permissionStatus = await _locationWeb.requestPermission();
+    if (permissionStatus != PermissionStatus.granted) {
+      setState(() => locationPermissionDenied = true);
+      _showPermissionDialog();
+      return;
+    }
+
+    final userLocationData = await _locationWeb.getLocation();
+    if (userLocationData.latitude != null &&
+        userLocationData.longitude != null) {
+      setState(() {
+        userLocation = userLocationData;
+        locationInitialized = true;
+        _updateUserMarker();
+      });
+      mapController.move(
+        LatLng(userLocation!.latitude!, userLocation!.longitude!),
+        15.0,
+      );
+    }
+
+    _locationSubscription?.cancel();
+    _locationSubscription = _locationWeb.onLocationChanged().listen(
+      (LocationData newLocation) {
+        if (newLocation.latitude != null && newLocation.longitude != null) {
+          setState(() {
+            userLocation = newLocation;
+            _updateUserMarker();
+          });
+        }
+      },
+      onError: (e) => _showSnackBar('Location update error: $e'),
+    );
+  }
+
+  Future<void> _retryNativeLocationPermission() async {
+    final permissionStatus = await _location.requestPermission();
+    if (permissionStatus != PermissionStatus.granted) {
+      setState(() => locationPermissionDenied = true);
+      _showPermissionDialog();
+      return;
+    }
+
+    final userLocationData = await _location.getLocation();
+    if (userLocationData.latitude != null &&
+        userLocationData.longitude != null) {
+      setState(() {
+        userLocation = userLocationData;
+        locationInitialized = true;
+        _updateUserMarker();
+      });
+      mapController.move(
+        LatLng(userLocation!.latitude!, userLocation!.longitude!),
+        15.0,
+      );
+    }
+
+    _locationSubscription?.cancel();
+    _locationSubscription =
+        _location.onLocationChanged.listen((LocationData newLocation) {
+      if (newLocation.latitude != null && newLocation.longitude != null) {
+        setState(() {
+          userLocation = newLocation;
+          _updateUserMarker();
+        });
+      }
+    });
+  }
+
+  // Show permission dialog for location access
   void _showPermissionDialog() {
     showDialog(
       context: context,
@@ -400,14 +457,11 @@ class _MapScreenState extends State<MapScreen> {
       builder: (context) => AlertDialog(
         title: const Text('Location Permission Required'),
         content: const Text(
-          'This app requires location access to show your current position on the map. Please enable location permissions to continue, or proceed without location access.',
+          'This app requires location access to show your position on the map. Please enable permissions to continue, or proceed without location access.',
         ),
         actions: [
           TextButton(
-            onPressed: () {
-              Navigator.pop(context);
-              // Proceed without location
-            },
+            onPressed: () => Navigator.pop(context),
             child: const Text('Continue Without Location'),
           ),
           TextButton(
@@ -422,46 +476,48 @@ class _MapScreenState extends State<MapScreen> {
     );
   }
 
-  void _addCurrentLocationMarker() {
+  // Update user's location marker on the map
+  void _updateUserMarker() {
+    if (userLocation == null) return;
     markers.removeWhere(
         (m) => m.child is Icon && (m.child as Icon).icon == Icons.my_location);
     markers.add(
       Marker(
         width: 80.0,
         height: 80.0,
-        point: LatLng(currentLocation!.latitude!, currentLocation!.longitude!),
+        point: LatLng(userLocation!.latitude!, userLocation!.longitude!),
         child: const Icon(Icons.my_location, color: Colors.blue, size: 40.0),
       ),
     );
   }
 
-  void _updateCurrentLocationMarker() {
-    markers.removeWhere(
-        (m) => m.child is Icon && (m.child as Icon).icon == Icons.my_location);
+  // Update car's location marker on the map
+  void _updateCarMarker() {
+    if (carLocation == null) return;
+    markers.removeWhere((m) =>
+        m.child is Icon && (m.child as Icon).icon == Icons.directions_car);
     markers.add(
       Marker(
         width: 80.0,
         height: 80.0,
-        point: LatLng(currentLocation!.latitude!, currentLocation!.longitude!),
-        child: const Icon(Icons.my_location, color: Colors.blue, size: 40.0),
+        point: carLocation!,
+        child:
+            const Icon(Icons.directions_car, color: Colors.green, size: 40.0),
       ),
     );
   }
 
+  // Fetch route from start to destination
   Future<void> _getRoute(LatLng destination) async {
-    if (currentLocation == null ||
-        currentLocation!.latitude == null ||
-        currentLocation!.longitude == null) {
+    if (carLocation == null) {
       _showSnackBar(
-          'Current location unavailable. Please enable location permissions or search for a starting location.');
+          'Car location unavailable. Use the "Get Car Location" button.');
       return;
     }
 
     setState(() => isLoading = true);
-    final start =
-        LatLng(currentLocation!.latitude!, currentLocation!.longitude!);
     try {
-      final route = await _locationService.getRoute(start, destination);
+      final route = await _locationService.getRoute(carLocation!, destination);
       if (route != null) {
         setState(() {
           routePoints = route;
@@ -487,10 +543,12 @@ class _MapScreenState extends State<MapScreen> {
     }
   }
 
+  // Add a destination marker and calculate route
   void _addDestinationMarker(LatLng point) {
     _getRoute(point);
   }
 
+  // Search for a location and update the map
   Future<void> _searchLocation(String query) async {
     if (query.isEmpty) return;
 
@@ -501,9 +559,8 @@ class _MapScreenState extends State<MapScreen> {
         setState(() {
           markers.clear();
           routePoints.clear();
-          if (currentLocation != null) {
-            _addCurrentLocationMarker();
-          }
+          if (userLocation != null) _updateUserMarker();
+          if (carLocation != null) _updateCarMarker();
           _addDestinationMarker(searchedLocation);
         });
         mapController.move(searchedLocation, 15.0);
@@ -517,6 +574,7 @@ class _MapScreenState extends State<MapScreen> {
     }
   }
 
+  // Debounce search input
   void _onSearchChanged(String value) {
     _debounce?.cancel();
     _debounce = Timer(const Duration(milliseconds: 500), () {
@@ -524,6 +582,7 @@ class _MapScreenState extends State<MapScreen> {
     });
   }
 
+  // Clear the map with confirmation
   void _clearMap() {
     showDialog(
       context: context,
@@ -541,9 +600,8 @@ class _MapScreenState extends State<MapScreen> {
               setState(() {
                 markers.clear();
                 routePoints.clear();
-                if (currentLocation != null) {
-                  _addCurrentLocationMarker();
-                }
+                if (userLocation != null) _updateUserMarker();
+                if (carLocation != null) _updateCarMarker();
               });
               Navigator.pop(context);
             },
@@ -554,31 +612,27 @@ class _MapScreenState extends State<MapScreen> {
     );
   }
 
+  // Export route data to CSV
   Future<void> _exportRouteToCSV() async {
     if (routePoints.isEmpty) {
       _showSnackBar('No route data to export.');
       return;
     }
 
-    // Interpolate to add more points
+    // Interpolate points for denser route
     List<LatLng> densePoints = [];
-    const int pointsBetween =
-        8; // Doubled from 4 to 8 to double the number of points
+    const int pointsBetween = 8;
 
-    // Interpolate between each pair of routePoints
     for (int i = 0; i < routePoints.length - 1; i++) {
       LatLng start = routePoints[i];
       LatLng end = routePoints[i + 1];
-      // Add interpolated points (including start, excluding end to avoid duplicates)
       List<LatLng> interpolated = interpolatePoints(start, end, pointsBetween);
       densePoints.addAll(interpolated.sublist(0, interpolated.length - 1));
     }
-    // Add the last point
     densePoints.add(routePoints.last);
 
+    // Convert to CSV data
     List<Map<String, dynamic>> csvData = [];
-
-    // Use the first point as the reference for local UTM coordinates
     final refPoint = densePoints.first;
     double refLat = refPoint.latitude;
     double refLon = refPoint.longitude;
@@ -588,28 +642,21 @@ class _MapScreenState extends State<MapScreen> {
       final nextPoint =
           (i + 1 < densePoints.length) ? densePoints[i + 1] : null;
 
-      // Calculate yaw (in degrees)
       double yaw = 0.0;
       if (nextPoint != null) {
         final deltaLat = nextPoint.latitude - currentPoint.latitude;
         final deltaLng = nextPoint.longitude - currentPoint.longitude;
-        yaw = (atan2(deltaLng, deltaLat) * (180 / pi)) % 360; // Yaw in degrees
+        yaw = (atan2(deltaLng, deltaLat) * (180 / pi)) % 360;
       }
 
-      // Convert LatLng to local UTM coordinates (x, y in meters)
       var utm = UTMConverter.toLocalUTM(
           currentPoint.latitude, currentPoint.longitude, refLat, refLon);
       double x = utm['x']!;
       double y = utm['y']!;
 
-      // Placeholder for z (elevation)
-      double z = 0.325; // Adjust if elevation data is available
-
-      // Placeholder for mps (speed)
-      double mps = 0.5; // Adjust as needed
-
-      // Placeholder for change_flag
-      int changeFlag = 0;
+      double z = 0.325; // Placeholder for elevation
+      double mps = 0.5; // Placeholder for speed
+      int changeFlag = 0; // Placeholder for change_flag
 
       csvData.add({
         'x': x.toStringAsFixed(6),
@@ -621,26 +668,15 @@ class _MapScreenState extends State<MapScreen> {
       });
     }
 
-    // CSV headers matching the image
     final csvContent =
         'x,y,z,yaw,mps,change_flag\n${csvData.map((row) => '${row['x']},${row['y']},${row['z']},${row['yaw']},${row['mps']},${row['change_flag']}').join('\n')}';
 
+    // Save or download the CSV file
     try {
       if (kIsWeb) {
-        final blob = html.Blob([csvContent], 'text/csv');
-        final url = html.Url.createObjectUrlFromBlob(blob);
-        final anchor = html.AnchorElement(href: url)
-          ..style.display = 'none'
-          ..download = 'route_data.csv';
-        html.document.body?.children.add(anchor);
-        anchor.click();
-        html.document.body?.children.remove(anchor);
-        html.Url.revokeObjectUrl(url);
+        _downloadCsvForWeb(csvContent);
       } else {
-        final file = await File('${Directory.systemTemp.path}/route_data.csv')
-            .writeAsString(csvContent);
-        await Share.shareXFiles([XFile(file.path)],
-            text: 'Exported route data');
+        await _saveCsvForNative(csvContent);
       }
       _showSnackBar('Route data exported successfully.');
     } catch (e) {
@@ -648,10 +684,50 @@ class _MapScreenState extends State<MapScreen> {
     }
   }
 
-  void _showSnackBar(String message) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message)),
-    );
+  // Download CSV file on web
+  void _downloadCsvForWeb(String csvContent) {
+    final blob = html.Blob([csvContent], 'text/csv');
+    final url = html.Url.createObjectUrlFromBlob(blob);
+    final anchor = html.AnchorElement(href: url)
+      ..style.display = 'none'
+      ..download = 'route_data.csv';
+    html.document.body?.children.add(anchor);
+    anchor.click();
+    html.document.body?.children.remove(anchor);
+    html.Url.revokeObjectUrl(url);
+  }
+
+  // Save CSV file on native platforms
+  Future<void> _saveCsvForNative(String csvContent) async {
+    final directory = await getApplicationDocumentsDirectory();
+    final customDirectory = Directory('${directory.path}/RouteData');
+
+    // Create directory if it doesn't exist
+    if (!await customDirectory.exists()) {
+      await customDirectory.create(recursive: true);
+    }
+
+    final filePath = '${customDirectory.path}/route_data.csv';
+    final file = File(filePath);
+
+    // Write the file, overwriting if it exists
+    await file.writeAsString(csvContent, flush: true);
+
+    // Share the file (optional)
+    await Share.shareXFiles([XFile(filePath)], text: 'Exported route data');
+  }
+
+  // Interpolate points between two LatLng points
+  List<LatLng> interpolatePoints(LatLng start, LatLng end, int numPoints) {
+    List<LatLng> interpolatedPoints = [];
+    for (int i = 0; i <= numPoints; i++) {
+      double fraction = i / numPoints;
+      double lat = start.latitude + (end.latitude - start.latitude) * fraction;
+      double lon =
+          start.longitude + (end.longitude - start.longitude) * fraction;
+      interpolatedPoints.add(LatLng(lat, lon));
+    }
+    return interpolatedPoints;
   }
 
   @override
@@ -695,11 +771,11 @@ class _MapScreenState extends State<MapScreen> {
                 FlutterMap(
                   mapController: mapController,
                   options: MapOptions(
-                    initialCenter: currentLocation != null
-                        ? LatLng(currentLocation!.latitude!,
-                            currentLocation!.longitude!)
+                    initialCenter: userLocation != null
+                        ? LatLng(
+                            userLocation!.latitude!, userLocation!.longitude!)
                         : defaultLocation,
-                    initialZoom: currentLocation != null ? 15.0 : 2.0,
+                    initialZoom: userLocation != null ? 15.0 : 2.0,
                     onTap: (tapPosition, point) => _addDestinationMarker(point),
                   ),
                   children: [
@@ -733,11 +809,10 @@ class _MapScreenState extends State<MapScreen> {
           FloatingActionButton(
             onPressed: () {
               if (!locationInitialized || locationPermissionDenied) {
-                _initializeLocation();
-              } else if (currentLocation != null) {
+                _initializeUserLocation();
+              } else if (userLocation != null) {
                 mapController.move(
-                  LatLng(
-                      currentLocation!.latitude!, currentLocation!.longitude!),
+                  LatLng(userLocation!.latitude!, userLocation!.longitude!),
                   15.0,
                 );
               } else {
@@ -747,12 +822,16 @@ class _MapScreenState extends State<MapScreen> {
             },
             child: const Icon(Icons.my_location),
           ),
-          const SizedBox(height: 16), // Space between buttons
+          const SizedBox(height: 16),
           FloatingActionButton(
-            onPressed: () {
-              // Send a command to the car (e.g., "START")
-              _sendCommandToCar('START');
-            },
+            onPressed: _fetchCarLocation,
+            backgroundColor: isWebSocketConnected ? Colors.green : Colors.grey,
+            tooltip: 'Get Car Location',
+            child: const Icon(Icons.directions_car),
+          ),
+          const SizedBox(height: 16),
+          FloatingActionButton(
+            onPressed: () => _sendCommandToCar('START'),
             backgroundColor: isWebSocketConnected ? Colors.green : Colors.grey,
             tooltip: 'Send Start Command to Car',
             child: const Icon(Icons.play_arrow),
