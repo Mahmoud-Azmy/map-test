@@ -11,6 +11,7 @@ import 'package:flutter_map_cancellable_tile_provider/flutter_map_cancellable_ti
 import 'package:http/http.dart' as http;
 import 'package:latlong2/latlong.dart';
 import 'package:location/location.dart';
+import 'package:map_test/utm.dart';
 import 'package:share_plus/share_plus.dart';
 
 import 'location_web.dart' if (dart.library.io) 'location_stub.dart';
@@ -483,13 +484,35 @@ class _MapScreenState extends State<MapScreen> {
       return;
     }
 
-    List<Map<String, dynamic>> csvData = [];
-    for (int i = 0; i < routePoints.length; i++) {
-      final currentPoint = routePoints[i];
-      final nextPoint =
-          (i + 1 < routePoints.length) ? routePoints[i + 1] : null;
+    // Interpolate to add more points
+    List<LatLng> densePoints = [];
+    const int pointsBetween =
+        8; // Doubled from 4 to 8 to double the number of points
 
-      // Calculate yaw (already in degrees)
+    // Interpolate between each pair of routePoints
+    for (int i = 0; i < routePoints.length - 1; i++) {
+      LatLng start = routePoints[i];
+      LatLng end = routePoints[i + 1];
+      // Add interpolated points (including start, excluding end to avoid duplicates)
+      List<LatLng> interpolated = interpolatePoints(start, end, pointsBetween);
+      densePoints.addAll(interpolated.sublist(0, interpolated.length - 1));
+    }
+    // Add the last point
+    densePoints.add(routePoints.last);
+
+    List<Map<String, dynamic>> csvData = [];
+
+    // Use the first point as the reference for local UTM coordinates
+    final refPoint = densePoints.first;
+    double refLat = refPoint.latitude;
+    double refLon = refPoint.longitude;
+
+    for (int i = 0; i < densePoints.length; i++) {
+      final currentPoint = densePoints[i];
+      final nextPoint =
+          (i + 1 < densePoints.length) ? densePoints[i + 1] : null;
+
+      // Calculate yaw (in degrees)
       double yaw = 0.0;
       if (nextPoint != null) {
         final deltaLat = nextPoint.latitude - currentPoint.latitude;
@@ -497,17 +520,19 @@ class _MapScreenState extends State<MapScreen> {
         yaw = (atan2(deltaLng, deltaLat) * (180 / pi)) % 360; // Yaw in degrees
       }
 
-      // Map LatLng to x, y (assuming longitude as x, latitude as y)
-      double x = currentPoint.longitude;
-      double y = currentPoint.latitude;
+      // Convert LatLng to local UTM coordinates (x, y in meters)
+      var utm = UTMConverter.toLocalUTM(
+          currentPoint.latitude, currentPoint.longitude, refLat, refLon);
+      double x = utm['x']!;
+      double y = utm['y']!;
 
-      // Placeholder for z (elevation) - Using a constant from your image
-      double z = 0.325; // Adjust if you can fetch elevation data
+      // Placeholder for z (elevation)
+      double z = 0.325; // Adjust if elevation data is available
 
-      // Placeholder for mps (speed) - Using a default value
-      double mps = 0.5; // Adjust as needed (e.g., calculate based on distance)
+      // Placeholder for mps (speed)
+      double mps = 0.5; // Adjust as needed
 
-      // Placeholder for change_flag - Using 0 as in your image
+      // Placeholder for change_flag
       int changeFlag = 0;
 
       csvData.add({
@@ -520,7 +545,7 @@ class _MapScreenState extends State<MapScreen> {
       });
     }
 
-    // Update CSV headers to match the image
+    // CSV headers matching the image
     final csvContent =
         'x,y,z,yaw,mps,change_flag\n${csvData.map((row) => '${row['x']},${row['y']},${row['z']},${row['yaw']},${row['mps']},${row['change_flag']}').join('\n')}';
 
