@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:html' as html;
-import 'dart:io' show Directory, File;
+import 'dart:io' show File;
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
@@ -13,7 +13,6 @@ import 'package:latlong2/latlong.dart';
 import 'package:location/location.dart';
 import 'package:map_test/utm.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:share_plus/share_plus.dart';
 import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
@@ -98,6 +97,7 @@ class _MapScreenState extends State<MapScreen> {
   bool isLoading = false;
   bool locationPermissionDenied = false;
   bool locationInitialized = false;
+  bool isRouteDrawn = false; // Track if route has been drawn
   Timer? _debounce;
   StreamSubscription<LocationData>? _locationSubscription;
 
@@ -127,14 +127,14 @@ class _MapScreenState extends State<MapScreen> {
     super.dispose();
   }
 
-  // Show a snackbar with a message
+  // ====================== Helper Methods ======================
   void _showSnackBar(String message) {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text(message)),
     );
   }
 
-  // Connect to the WebSocket server and handle messages
+  // ====================== WebSocket Methods ======================
   void _connectWebSocket() {
     try {
       const wsUrl = 'ws://127.0.0.1:8765';
@@ -154,7 +154,6 @@ class _MapScreenState extends State<MapScreen> {
               );
               _updateCarMarker();
             });
-            // Complete the completer if waiting for a location update
             if (_carLocationCompleter != null &&
                 !_carLocationCompleter!.isCompleted) {
               _carLocationCompleter!.complete(carLocation);
@@ -167,7 +166,6 @@ class _MapScreenState extends State<MapScreen> {
         onDone: () {
           setState(() => isWebSocketConnected = false);
           _showSnackBar('WebSocket connection closed');
-          // Complete the completer with an error if the connection closes
           if (_carLocationCompleter != null &&
               !_carLocationCompleter!.isCompleted) {
             _carLocationCompleter!.completeError('WebSocket connection closed');
@@ -176,7 +174,6 @@ class _MapScreenState extends State<MapScreen> {
         onError: (error) {
           setState(() => isWebSocketConnected = false);
           _showSnackBar('WebSocket error: $error');
-          // Complete the completer with an error if there's a WebSocket error
           if (_carLocationCompleter != null &&
               !_carLocationCompleter!.isCompleted) {
             _carLocationCompleter!.completeError(error);
@@ -196,7 +193,6 @@ class _MapScreenState extends State<MapScreen> {
     }
   }
 
-  // Send a command to the car via WebSocket
   void _sendCommandToCar(String command) {
     if (!isWebSocketConnected || _webSocketChannel == null) {
       _showSnackBar('WebSocket not connected. Please try again.');
@@ -217,7 +213,6 @@ class _MapScreenState extends State<MapScreen> {
     }
   }
 
-  // Fetch car location manually and zoom to it
   Future<void> _fetchCarLocation() async {
     if (!isWebSocketConnected || _webSocketChannel == null) {
       _showSnackBar('WebSocket not connected. Please try again.');
@@ -226,28 +221,26 @@ class _MapScreenState extends State<MapScreen> {
     }
 
     setState(() => isLoading = true);
-    _carLocationCompleter = Completer<LatLng>(); // Create a new completer
+    _carLocationCompleter = Completer<LatLng>();
 
     try {
       _sendCommandToCar('GET_LOCATION');
-      // Wait for the car location to be updated
       final location = await _carLocationCompleter!.future.timeout(
         const Duration(seconds: 5),
         onTimeout: () {
           throw TimeoutException('Failed to get car location: Timed out');
         },
       );
-      // Zoom to the car location after receiving it
       mapController.move(location, 15.0);
     } catch (e) {
       _showSnackBar('Failed to fetch car location: $e');
     } finally {
       setState(() => isLoading = false);
-      _carLocationCompleter = null; // Reset the completer
+      _carLocationCompleter = null;
     }
   }
 
-  // Initialize user location with permission handling
+  // ====================== Location Methods ======================
   Future<void> _initializeUserLocation() async {
     if (locationInitialized) return;
 
@@ -357,7 +350,6 @@ class _MapScreenState extends State<MapScreen> {
     });
   }
 
-  // Retry location permission request
   Future<void> _retryLocationPermission() async {
     setState(() {
       locationPermissionDenied = false;
@@ -449,7 +441,6 @@ class _MapScreenState extends State<MapScreen> {
     });
   }
 
-  // Show permission dialog for location access
   void _showPermissionDialog() {
     showDialog(
       context: context,
@@ -476,7 +467,7 @@ class _MapScreenState extends State<MapScreen> {
     );
   }
 
-  // Update user's location marker on the map
+  // ====================== Marker Methods ======================
   void _updateUserMarker() {
     if (userLocation == null) return;
     markers.removeWhere(
@@ -491,7 +482,6 @@ class _MapScreenState extends State<MapScreen> {
     );
   }
 
-  // Update car's location marker on the map
   void _updateCarMarker() {
     if (carLocation == null) return;
     markers.removeWhere((m) =>
@@ -507,7 +497,7 @@ class _MapScreenState extends State<MapScreen> {
     );
   }
 
-  // Fetch route from start to destination
+  // ====================== Route Methods ======================
   Future<void> _getRoute(LatLng destination) async {
     if (carLocation == null) {
       _showSnackBar(
@@ -521,6 +511,7 @@ class _MapScreenState extends State<MapScreen> {
       if (route != null) {
         setState(() {
           routePoints = route;
+          isRouteDrawn = true; // Set route as drawn
           markers.removeWhere((m) =>
               m.child is Icon && (m.child as Icon).icon == Icons.location_on);
           markers.add(
@@ -535,20 +526,21 @@ class _MapScreenState extends State<MapScreen> {
         });
       } else {
         _showSnackBar('Failed to fetch route.');
+        setState(() => isRouteDrawn = false);
       }
     } catch (e) {
       _showSnackBar('Error fetching route: $e');
+      setState(() => isRouteDrawn = false);
     } finally {
       setState(() => isLoading = false);
     }
   }
 
-  // Add a destination marker and calculate route
   void _addDestinationMarker(LatLng point) {
     _getRoute(point);
   }
 
-  // Search for a location and update the map
+  // ====================== Search Methods ======================
   Future<void> _searchLocation(String query) async {
     if (query.isEmpty) return;
 
@@ -559,6 +551,7 @@ class _MapScreenState extends State<MapScreen> {
         setState(() {
           markers.clear();
           routePoints.clear();
+          isRouteDrawn = false;
           if (userLocation != null) _updateUserMarker();
           if (carLocation != null) _updateCarMarker();
           _addDestinationMarker(searchedLocation);
@@ -574,7 +567,6 @@ class _MapScreenState extends State<MapScreen> {
     }
   }
 
-  // Debounce search input
   void _onSearchChanged(String value) {
     _debounce?.cancel();
     _debounce = Timer(const Duration(milliseconds: 500), () {
@@ -582,7 +574,7 @@ class _MapScreenState extends State<MapScreen> {
     });
   }
 
-  // Clear the map with confirmation
+  // ====================== Map Management Methods ======================
   void _clearMap() {
     showDialog(
       context: context,
@@ -600,6 +592,7 @@ class _MapScreenState extends State<MapScreen> {
               setState(() {
                 markers.clear();
                 routePoints.clear();
+                isRouteDrawn = false;
                 if (userLocation != null) _updateUserMarker();
                 if (carLocation != null) _updateCarMarker();
               });
@@ -612,13 +605,23 @@ class _MapScreenState extends State<MapScreen> {
     );
   }
 
-  // Export route data to CSV
+  // ====================== CSV Export Methods ======================// ====================== CSV Export Methods ======================
   Future<void> _exportRouteToCSV() async {
     if (routePoints.isEmpty) {
       _showSnackBar('No route data to export.');
       return;
     }
 
+    try {
+      // Generate and download CSV in one step
+      _generateAndDownloadCsv();
+      _showSnackBar('Route data exported successfully.');
+    } catch (e) {
+      _showSnackBar('Error exporting route: $e');
+    }
+  }
+
+  void _generateAndDownloadCsv() {
     // Interpolate points for denser route
     List<LatLng> densePoints = [];
     const int pointsBetween = 8;
@@ -668,56 +671,79 @@ class _MapScreenState extends State<MapScreen> {
       });
     }
 
+    // Generate CSV content string
     final csvContent =
         'x,y,z,yaw,mps,change_flag\n${csvData.map((row) => '${row['x']},${row['y']},${row['z']},${row['yaw']},${row['mps']},${row['change_flag']}').join('\n')}';
 
-    // Save or download the CSV file
-    try {
-      if (kIsWeb) {
-        _downloadCsvForWeb(csvContent);
-      } else {
-        await _saveCsvForNative(csvContent);
-      }
-      _showSnackBar('Route data exported successfully.');
-    } catch (e) {
-      _showSnackBar('Error exporting route: $e');
-    }
+    // Download the CSV file
+    _downloadCsvForWeb(csvContent);
   }
 
-  // Download CSV file on web
   void _downloadCsvForWeb(String csvContent) {
+    // Generate filename with timestamp to avoid duplicates
+    final now = DateTime.now();
+    final timestamp =
+        '${now.year}${now.month.toString().padLeft(2, '0')}${now.day.toString().padLeft(2, '0')}_${now.hour.toString().padLeft(2, '0')}${now.minute.toString().padLeft(2, '0')}';
+    final filename = 'route_data_$timestamp.csv';
+
+    // Create and trigger download
     final blob = html.Blob([csvContent], 'text/csv');
     final url = html.Url.createObjectUrlFromBlob(blob);
     final anchor = html.AnchorElement(href: url)
       ..style.display = 'none'
-      ..download = 'route_data.csv';
+      ..download = filename;
+
     html.document.body?.children.add(anchor);
     anchor.click();
+
+    // Clean up
     html.document.body?.children.remove(anchor);
     html.Url.revokeObjectUrl(url);
   }
 
-  // Save CSV file on native platforms
   Future<void> _saveCsvForNative(String csvContent) async {
-    final directory = await getApplicationDocumentsDirectory();
-    final customDirectory = Directory('${directory.path}/RouteData');
-
-    // Create directory if it doesn't exist
-    if (!await customDirectory.exists()) {
-      await customDirectory.create(recursive: true);
-    }
-
-    final filePath = '${customDirectory.path}/route_data.csv';
+    // Define the specific file path where you want to save the CSV
+    const filePath = 'D:/book_images/route_data.csv';
     final file = File(filePath);
 
-    // Write the file, overwriting if it exists
-    await file.writeAsString(csvContent, flush: true);
+    try {
+      // Check if file exists and delete it
+      if (await file.exists()) {
+        await file.delete();
+      }
 
-    // Share the file (optional)
-    await Share.shareXFiles([XFile(filePath)], text: 'Exported route data');
+      // Create parent directories if they don't exist
+      if (!await file.parent.exists()) {
+        await file.parent.create(recursive: true);
+      }
+
+      // Write the new file
+      await file.writeAsString(csvContent, flush: true);
+
+      _showSnackBar('Route data saved to $filePath');
+    } catch (e) {
+      _showSnackBar('Error saving file: $e');
+      // Fallback to default location if there's an error
+      await _saveCsvToDefaultLocation(csvContent);
+    }
   }
 
-  // Interpolate points between two LatLng points
+  Future<void> _saveCsvToDefaultLocation(String csvContent) async {
+    try {
+      final directory = await getApplicationDocumentsDirectory();
+      final file = File('${directory.path}/route_data.csv');
+
+      if (await file.exists()) {
+        await file.delete();
+      }
+
+      await file.writeAsString(csvContent, flush: true);
+      _showSnackBar('Route data saved to default location: ${file.path}');
+    } catch (e) {
+      _showSnackBar('Error saving to default location: $e');
+    }
+  }
+
   List<LatLng> interpolatePoints(LatLng start, LatLng end, int numPoints) {
     List<LatLng> interpolatedPoints = [];
     for (int i = 0; i <= numPoints; i++) {
@@ -831,9 +857,18 @@ class _MapScreenState extends State<MapScreen> {
           ),
           const SizedBox(height: 16),
           FloatingActionButton(
-            onPressed: () => _sendCommandToCar('START'),
-            backgroundColor: isWebSocketConnected ? Colors.green : Colors.grey,
-            tooltip: 'Send Start Command to Car',
+            onPressed: isRouteDrawn && isWebSocketConnected
+                ? () {
+                    _exportRouteToCSV();
+                    _sendCommandToCar('START');
+                  }
+                : null,
+            backgroundColor: isRouteDrawn && isWebSocketConnected
+                ? Colors.green
+                : Colors.grey,
+            tooltip: isRouteDrawn
+                ? 'Send Start Command to Car'
+                : 'Draw a route first',
             child: const Icon(Icons.play_arrow),
           ),
         ],
